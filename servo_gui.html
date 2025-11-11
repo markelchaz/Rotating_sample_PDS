@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Arduino Servo Controller</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 600px;
+      margin: 20px auto;
+      padding: 10px;
+    }
+    h1 {
+      font-size: 1.5rem;
+    }
+    .section {
+      margin: 10px 0;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+    }
+    label {
+      display: block;
+      margin: 5px 0;
+    }
+    input[type="number"] {
+      width: 80px;
+    }
+    button {
+      margin: 5px 5px 5px 0;
+      padding: 5px 10px;
+    }
+    #log {
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      padding: 5px;
+      height: 150px;
+      overflow-y: auto;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+    }
+    #status {
+      font-weight: bold;
+      margin-left: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Arduino Servo Controller</h1>
+
+  <div class="section">
+    <button id="connectBtn">Connect</button>
+    <span id="status">Not connected</span>
+  </div>
+
+  <div class="section">
+    <label>
+      Target angle (0–90°):
+      <input type="number" id="angleInput" min="0" max="90" value="0">
+    </label>
+    <button id="setAngleBtn">Set angle</button>
+  </div>
+
+  <div class="section">
+    <label>
+      Step size (degrees per step):
+      <input type="number" id="stepInput" min="1" value="5">
+    </label>
+    <button id="setStepBtn">Set step</button>
+
+    <label>
+      Time between steps (ms):
+      <input type="number" id="intervalInput" min="10" value="500">
+    </label>
+    <button id="setIntervalBtn">Set interval</button>
+  </div>
+
+  <div class="section">
+    <button id="runBtn">Run</button>
+    <button id="stopBtn">Stop</button>
+    <button id="stepOnceBtn">Step once</button>
+    <button id="resetBtn">Reset to 0°</button>
+    <button id="refreshBtn">Refresh state</button>
+  </div>
+
+  <div class="section">
+    <div><strong>Current angle:</strong> <span id="currentAngle">0</span>°</div>
+    <div><strong>State:</strong> <span id="state">UNKNOWN</span></div>
+  </div>
+
+  <div class="section">
+    <strong>Log</strong>
+    <pre id="log"></pre>
+  </div>
+
+  <script>
+    let port = null;
+    let reader = null;
+    let writer = null;
+
+    const textDecoder = new TextDecoderStream();
+    const textEncoder = new TextEncoderStream();
+    let readBuffer = "";
+
+    const connectBtn      = document.getElementById('connectBtn');
+    const statusSpan      = document.getElementById('status');
+    const angleInput      = document.getElementById('angleInput');
+    const stepInput       = document.getElementById('stepInput');
+    const intervalInput   = document.getElementById('intervalInput');
+    const setAngleBtn     = document.getElementById('setAngleBtn');
+    const setStepBtn      = document.getElementById('setStepBtn');
+    const setIntervalBtn  = document.getElementById('setIntervalBtn');
+    const runBtn          = document.getElementById('runBtn');
+    const stopBtn         = document.getElementById('stopBtn');
+    const stepOnceBtn     = document.getElementById('stepOnceBtn');
+    const resetBtn        = document.getElementById('resetBtn');
+    const refreshBtn      = document.getElementById('refreshBtn');
+    const currentAngleSpan = document.getElementById('currentAngle');
+    const stateSpan       = document.getElementById('state');
+    const logElem         = document.getElementById('log');
+
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      logElem.textContent += `[${time}] ${msg}\n`;
+      logElem.scrollTop = logElem.scrollHeight;
+    }
+
+    function setStatus(text) {
+      statusSpan.textContent = text;
+    }
+
+    function sendCommand(cmd) {
+      if (!writer) {
+        log("Not connected; cannot send: " + cmd);
+        return;
+      }
+      log(">> " + cmd);
+      writer.write(cmd + "\n");
+    }
+
+    async function readLoop() {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            log("Reader closed");
+            break;
+          }
+          if (value) {
+            readBuffer += value;
+            const lines = readBuffer.split(/\r?\n/);
+            readBuffer = lines.pop(); // last incomplete line
+            for (const line of lines) {
+              if (line.trim().length > 0) {
+                handleLine(line.trim());
+              }
+            }
+          }
+        }
+      } catch (error) {
+        log("Read error: " + error);
+      }
+    }
+
+    function handleLine(line) {
+      log("<< " + line);
+      if (line.startsWith("ANGLE")) {
+        const parts = line.split(/\s+/);
+        if (parts.length >= 2) {
+          const angle = parseInt(parts[1], 10);
+          if (!Number.isNaN(angle)) {
+            currentAngleSpan.textContent = angle;
+            // also update angle input so GUI matches the board
+            angleInput.value = angle;
+          }
+        }
+      } else if (line.startsWith("STATE")) {
+        const parts = line.split(/\s+/);
+        if (parts.length >= 2) {
+          stateSpan.textContent = parts[1];
+        }
+      }
+    }
+
+    async function connectSerial() {
+      if (!("serial" in navigator)) {
+        alert("Web Serial API not supported in this browser. Use Chrome or Edge desktop.");
+        return;
+      }
+
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        // set up reading
+        const readableClosed = port.readable.pipeTo(textDecoder.writable);
+        reader = textDecoder.readable.getReader();
+
+        // set up writing
+        const writableClosed = textEncoder.readable.pipeTo(port.writable);
+        writer = textEncoder.writable.getWriter();
+
+        setStatus("Connected");
+        log("Connected to serial port");
+
+        // start reading loop
+        readLoop();
+
+        // ask Arduino for current state
+        sendCommand("GET");
+      } catch (error) {
+        log("Connection error: " + error);
+        setStatus("Connection failed");
+      }
+    }
+
+    connectBtn.addEventListener('click', async () => {
+      if (!port) {
+        await connectSerial();
+      } else {
+        // optional: implement disconnect
+        log("Already connected");
+      }
+    });
+
+    setAngleBtn.addEventListener('click', () => {
+      let angle = parseInt(angleInput.value, 10);
+      if (Number.isNaN(angle)) angle = 0;
+      if (angle < 0) angle = 0;
+      if (angle > 90) angle = 90;
+      angleInput.value = angle;
+      sendCommand("SET_ANGLE " + angle);
+    });
+
+    setStepBtn.addEventListener('click', () => {
+      let step = parseInt(stepInput.value, 10);
+      if (Number.isNaN(step) || step <= 0) step = 1;
+      stepInput.value = step;
+      sendCommand("SET_STEP " + step);
+    });
+
+    setIntervalBtn.addEventListener('click', () => {
+      let interval = parseInt(intervalInput.value, 10);
+      if (Number.isNaN(interval) || interval < 10) interval = 10;
+      intervalInput.value = interval;
+      sendCommand("SET_INTERVAL " + interval);
+    });
+
+    runBtn.addEventListener('click', () => {
+      sendCommand("RUN");
+    });
+
+    stopBtn.addEventListener('click', () => {
+      sendCommand("STOP");
+    });
+
+    stepOnceBtn.addEventListener('click', () => {
+      sendCommand("STEP");
+    });
+
+    resetBtn.addEventListener('click', () => {
+      sendCommand("RESET");
+      // UI will update when Arduino sends ANGLE/STATE
+    });
+
+    refreshBtn.addEventListener('click', () => {
+      sendCommand("GET");
+    });
+  </script>
+</body>
+</html>
